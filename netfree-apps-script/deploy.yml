@@ -1,0 +1,176 @@
+name: Deploy to Google Apps Script
+
+# Runs on GitHub servers (outside the filtered network).
+# Every Apps Script project lives in its own folder:
+#   projects/<name>/.clasp.json   {"scriptId": "...", "rootDir": "code"}
+#   projects/<name>/account       one word, the Google account label (for example myaccount)
+#   projects/<name>/code/         the project files, named exactly as in Apps Script, plus appsscript.json
+#   projects/<name>/deployment    optional: the deployment ID of a published web app or add-on;
+#                                 after each upload that deployment is moved to a new version
+# The login for each account is the secret CLASP_<LABEL> (for example CLASP_MYACCOUNT),
+# holding the .clasprc.json made by: clasp -A <folder>/.clasprc.json login
+# A project is uploaded when its folder differs from its last successful upload (tag deployed-<name>).
+# After every upload attempt the robot leaves a note: the annotated tag status-<name> on the pushed
+# commit, whose message is "ok" or one fixed reason code (see the steps below). Read it with:
+#   git fetch -f origin "refs/tags/*:refs/tags/*"
+#   git for-each-ref refs/tags/status-* --format="%(refname:short) %(*objectname) %(contents:subject)"
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'projects/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Never run two uploads at the same time.
+concurrency:
+  group: apps-script-deploy
+  cancel-in-progress: false
+
+# Needed to move the deployed-<name> tags after a successful upload.
+permissions:
+  contents: write
+
+jobs:
+  find-projects:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.find.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find projects that changed since their last upload
+        id: find
+        run: |
+          list='[]'
+          for dir in projects/*/; do
+            dir=${dir%/}; name=$(basename "$dir")
+            [ -f "$dir/.clasp.json" ] && [ -f "$dir/account" ] || { echo "Skipping $name: missing .clasp.json or account"; continue; }
+            if git rev-parse -q --verify "refs/tags/deployed-$name" >/dev/null &&
+               git diff --quiet "refs/tags/deployed-$name" HEAD -- "$dir"; then
+              echo "$name: no changes"
+              continue
+            fi
+            account=$(tr -d ' \r\n' < "$dir/account")
+            echo "$name: will upload (account $account)"
+            list=$(jq -c --arg n "$name" --arg a "$account" '. + [{name: $n, account: $a}]' <<< "$list")
+          done
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  upload:
+    needs: find-projects
+    if: needs.find-projects.outputs.list != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.find-projects.outputs.list) }}
+    name: upload ${{ matrix.project.name }}
+    env:
+      LC_ALL: C.UTF-8
+      NAME: ${{ matrix.project.name }}
+      DIR: projects/${{ matrix.project.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install clasp
+        run: npm install -g @google/clasp@3.4.1
+
+      - name: Write credentials
+        env:
+          CREDS: ${{ secrets[format('CLASP_{0}', matrix.project.account)] }}
+          ACCOUNT: ${{ matrix.project.account }}
+        run: |
+          if [ -z "$CREDS" ]; then
+            echo "missing-secret" > "$RUNNER_TEMP/reason"
+            echo "::error::Missing secret CLASP_${ACCOUNT^^} for account $ACCOUNT."
+            exit 1
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/auth"
+          printf '%s' "$CREDS" > "$RUNNER_TEMP/auth/.clasprc.json"
+
+      # clasp push overwrites everything in the project. So before uploading we download
+      # the live version and make sure this push already contains it: the live code must
+      # equal the code folder in the last successful upload (tag deployed-<name>) or in one
+      # of the commits since then (for example a "sync from Google" commit made after clasp pull).
+      # If someone edited the project directly in Google and that edit is not here, we stop.
+      - name: Safety check - live version is included in this push
+        run: |
+          live="$RUNNER_TEMP/live"
+          mkdir -p "$live"
+          jq --arg d "$live" '.rootDir = $d' "$DIR/.clasp.json" > "$RUNNER_TEMP/live.clasp.json"
+          clasp -A "$RUNNER_TEMP/auth/.clasprc.json" -P "$RUNNER_TEMP/live.clasp.json" pull ||
+            { echo "google-access-failed" > "$RUNNER_TEMP/reason"; exit 1; }
+          # same = every file matches by name (ignoring .js/.gs and line endings), none extra
+          same() {
+            local dir=$1
+            for f in "$dir"/*; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f"); n="${base%.*}"
+              l=$(ls "$live"/"$n".* 2>/dev/null | head -n 1)
+              [ -n "$l" ] || return 1
+              diff -q --strip-trailing-cr "$f" "$l" >/dev/null || return 1
+            done
+            for l in "$live"/*; do
+              base=$(basename "$l"); n="${base%.*}"
+              ls "$dir"/"$n".* >/dev/null 2>&1 || return 1
+            done
+          }
+          if git rev-parse -q --verify "refs/tags/deployed-$NAME" >/dev/null; then
+            candidates="$(git rev-parse "refs/tags/deployed-$NAME") $(git rev-list "refs/tags/deployed-$NAME..HEAD" -- "$DIR")"
+          else
+            candidates=$(git rev-list HEAD -- "$DIR")
+          fi
+          for c in $candidates; do
+            git cat-file -e "$c:$DIR/code" 2>/dev/null || continue
+            rm -rf "$RUNNER_TEMP/cand"; mkdir -p "$RUNNER_TEMP/cand"
+            git archive "$c" "$DIR/code" | tar -x -C "$RUNNER_TEMP/cand"
+            if same "$RUNNER_TEMP/cand/$DIR/code"; then
+              echo "Live version is included in this push (commit $c)."
+              exit 0
+            fi
+          done
+          echo "changed-in-google" > "$RUNNER_TEMP/reason"
+          echo "::error::The live project $NAME was changed directly in Google and that change is not in this push. Run clasp pull on your computer, commit it, merge your change, and push again."
+          exit 1
+
+      - name: Upload
+        run: |
+          clasp -A "$RUNNER_TEMP/auth/.clasprc.json" -P "$DIR" push --force ||
+            { echo "upload-failed" > "$RUNNER_TEMP/reason"; exit 1; }
+
+      # Only for published web apps and add-ons: point the existing link at the new code.
+      - name: Update published version
+        if: hashFiles(format('{0}/deployment', env.DIR)) != ''
+        run: |
+          id=$(tr -d ' \r\n' < "$DIR/deployment")
+          clasp -A "$RUNNER_TEMP/auth/.clasprc.json" -P "$DIR" create-deployment -i "$id" -d "Uploaded from $GITHUB_SHA" ||
+            { echo "publish-failed" > "$RUNNER_TEMP/reason"; exit 1; }
+
+      # Remember what was uploaded, for the next run.
+      - name: Mark as deployed
+        run: |
+          { git tag -f "deployed-$NAME" HEAD && git push -f origin "refs/tags/deployed-$NAME"; } ||
+            { echo "mark-failed" > "$RUNNER_TEMP/reason"; exit 1; }
+
+      - name: Remove credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/auth" "$RUNNER_TEMP/live.clasp.json"
+
+      # The note Claude reads from the computer: "ok" or the reason code written above.
+      - name: Leave a status note
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then msg=ok; else msg=$(cat "$RUNNER_TEMP/reason" 2>/dev/null || echo unknown-error); fi
+          git -c user.name="github-actions[bot]" -c user.email="41898283+github-actions[bot]@users.noreply.github.com" \
+            tag -f -a "status-$NAME" -m "$msg" HEAD
+          git push -f origin "refs/tags/status-$NAME"
